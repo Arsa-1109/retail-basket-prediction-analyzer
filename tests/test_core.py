@@ -1,7 +1,16 @@
 """Unit and CLI tests for Retail Basket Prediction Analyzer (Milestones 1-5)."""
 import pytest
 
-from app.core import BasketNGramModel, SmallBasketLM, milestone_1, milestone_2, milestone_3, parse_basket, support_of
+from app.core import (
+    BasketNGramModel,
+    SmallBasketLM,
+    milestone_1,
+    milestone_2,
+    milestone_3,
+    milestone_4,
+    parse_basket,
+    support_of,
+)
 
 
 # Milestone 1: Generate a synthetic dataset of shopping baskets with planted itemsets.
@@ -64,9 +73,20 @@ def test_milestone_3():
 
 
 # Milestone 4: Evaluate both models using next-item prediction metrics (e.g., accuracy, rank).
-@pytest.mark.skip(reason="remove this line when you start milestone 4")
 def test_milestone_4():
-    raise NotImplementedError("write the test for milestone 4")
+    ds = milestone_1(n_baskets=500, n_items=160, seed=42)
+    ngram = milestone_2(dataset=ds, n=3, smoothing=0.1)
+    lm = milestone_3(dataset=ds, embed_dim=32, hidden_dim=48, epochs=6)
+    ev = milestone_4(dataset=ds, ngram_model=ngram, lm_model=lm, n_cases=100)
+    assert ev["n_cases"] == 100
+    metrics = ev["metrics"]
+    assert "Popularity Baseline" in metrics
+    assert any(k.startswith("N-Gram") for k in metrics)
+    assert any(k.startswith("Small LM") for k in metrics)
+    for row in metrics.values():
+        assert 0.0 <= row["top1_acc"] <= row["recall_at_5"] <= row["recall_at_10"] <= 1.0
+        assert 0.0 < row["mrr"] <= 1.0
+        assert 1.0 <= row["mean_rank"] <= len(ds.catalog)
 
 
 # Milestone 5: Present a comparison of the models' performance.

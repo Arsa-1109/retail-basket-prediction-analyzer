@@ -492,9 +492,130 @@ def milestone_3(
 
 
 # --- Milestone 4: Evaluate both models using next-item prediction metrics (e.g., accuracy, rank).
-# Hint: Define and calculate appropriate next-item prediction metrics like accuracy or rank.
-def milestone_4():  # TODO(milestone 4)
-    raise NotImplementedError("TODO(milestone 4)")
+def build_planted_probe_cases(
+    dataset: BasketDataset,
+    max_cases: int = 180,
+    seed: int = 42,
+) -> list[dict]:
+    """Build evaluation cases from held-out baskets that contain a planted itemset."""
+    rng = np.random.default_rng(seed)
+    planted_sets = [
+        (p, set(p.items))
+        for p in dataset.planted
+    ]
+    cases: list[dict] = []
+    for basket in dataset.test_baskets:
+        distinct = sorted(set(basket))
+        basket_set = set(distinct)
+        for p, p_set in planted_sets:
+            if p_set <= basket_set:
+                target = str(rng.choice(list(p.items)))
+                visible = [item for item in distinct if item != target]
+                # Shuffle visible so planted co-items sit at arbitrary (often non-adjacent) positions
+                perm = rng.permutation(len(visible))
+                shuffled_visible = [visible[int(i)] for i in perm]
+                cases.append(
+                    {
+                        "visible": shuffled_visible,
+                        "target": target,
+                        "kind": p.kind,
+                        "set_size": len(p.items),
+                    }
+                )
+                break
+        if len(cases) >= max_cases:
+            break
+    return cases
+
+
+def score_cases_with_fn(
+    score_fn,
+    cases: Sequence[dict],
+    dataset: BasketDataset,
+) -> dict:
+    """Compute Top-1, Recall@K, Mean/Median Rank, MRR, MAP@5, and Repeat Share@5."""
+    pos_map = {name: idx for idx, name in enumerate(dataset.item_names)}
+    ranks: list[int] = []
+    repeat_shares: list[float] = []
+
+    for case in cases:
+        visible = case["visible"]
+        target = case["target"]
+        scores = np.asarray(score_fn(visible), dtype=np.float64)
+        vis_idx = [pos_map[item] for item in visible if item in pos_map]
+        target_idx = pos_map[target]
+        ranks.append(rank_of(scores, target_idx, vis_idx))
+        top5 = recommend_top_k(scores, k=5, exclude=vis_idx)
+        repeat_shares.append(repeat_share(top5, vis_idx, dataset.catalog))
+
+    ranks_arr = np.asarray(ranks, dtype=np.float64)
+    summary = summarise(ranks, ks=(1, 3, 5, 10))
+    map_at_5 = float(np.mean(np.where(ranks_arr <= 5, 1.0 / ranks_arr, 0.0))) if len(ranks) else 0.0
+    return {
+        "n_cases": len(cases),
+        "top1_acc": round(summary["hits@1"], 4),
+        "recall_at_3": round(summary["hits@3"], 4),
+        "recall_at_5": round(summary["hits@5"], 4),
+        "recall_at_10": round(summary["hits@10"], 4),
+        "mean_rank": round(float(np.mean(ranks_arr)), 2) if len(ranks) else 0.0,
+        "median_rank": round(summary["median_rank"], 2) if len(ranks) else 0.0,
+        "mrr": round(summary["mrr"], 4),
+        "map_at_5": round(map_at_5, 4),
+        "repeat_share_at_5": round(float(np.mean(repeat_shares)), 4) if repeat_shares else 0.0,
+        "ranks": ranks,
+    }
+
+
+def evaluate_models(
+    dataset: BasketDataset | None = None,
+    ngram_model: BasketNGramModel | None = None,
+    lm_model: SmallBasketLM | None = None,
+    n_cases: int = 250,
+    seed: int = 42,
+) -> dict:
+    """Evaluate Popularity baseline, N-Gram model, and Small LM on identical held-out cases."""
+    ds = milestone_1() if dataset is None else dataset
+    ngram = milestone_2(ds) if ngram_model is None else ngram_model
+    lm = milestone_3(ds) if lm_model is None else lm_model
+
+    cases = make_cases(ds.test_baskets, ds.item_names, n_cases=min(n_cases, len(ds.test_baskets)), seed=seed)
+    pop_vec = popularity_scores(ds.train_baskets, ds.item_names)
+    item_to_item = ItemToItem(ds.train_baskets, ds.item_names)
+
+    predictors = {
+        "Popularity Baseline": lambda _vis: pop_vec,
+        "Item-to-Item (Count)": lambda vis: item_to_item.score(vis, lift=True),
+        f"N-Gram (n={ngram.n})": lambda vis: ngram.score_items(vis, ds.item_names),
+        f"Small LM (d={lm.embed_dim})": lambda vis: lm.score_items(vis, ds.item_names),
+    }
+
+    metrics = {
+        name: score_cases_with_fn(fn, cases, ds)
+        for name, fn in predictors.items()
+    }
+    return {
+        "n_cases": len(cases),
+        "n_catalog": len(ds.catalog),
+        "n_train": len(ds.train_baskets),
+        "n_test": len(ds.test_baskets),
+        "metrics": metrics,
+        "cases": cases,
+    }
+
+
+def milestone_4(
+    dataset: BasketDataset | None = None,
+    ngram_model: BasketNGramModel | None = None,
+    lm_model: SmallBasketLM | None = None,
+    n_cases: int = 250,
+) -> dict:
+    """Milestone 4 entrypoint: evaluate next-item predictors on held-out baskets."""
+    return evaluate_models(
+        dataset=dataset,
+        ngram_model=ngram_model,
+        lm_model=lm_model,
+        n_cases=n_cases,
+    )
 
 
 # --- Milestone 5: Present a comparison of the models' performance.
