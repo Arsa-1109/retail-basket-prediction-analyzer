@@ -1,7 +1,7 @@
 """Unit and CLI tests for Retail Basket Prediction Analyzer (Milestones 1-5)."""
 import pytest
 
-from app.core import milestone_1, parse_basket, support_of
+from app.core import BasketNGramModel, milestone_1, milestone_2, parse_basket, support_of
 
 
 # Milestone 1: Generate a synthetic dataset of shopping baskets with planted itemsets.
@@ -28,9 +28,21 @@ def test_milestone_1():
 
 
 # Milestone 2: Implement the n-gram model to predict next items in a basket.
-@pytest.mark.skip(reason="remove this line when you start milestone 2")
 def test_milestone_2():
-    raise NotImplementedError("write the test for milestone 2")
+    ds = milestone_1(n_baskets=400, n_items=160, seed=42)
+    model = milestone_2(dataset=ds, n=3, smoothing=0.1)
+    assert model.n == 3
+    assert model.n_sequences > 0
+
+    # Natural planted pair should rank partner high when seeded with the first item
+    natural_pair = next(p for p in ds.planted if len(p.items) == 2 and p.kind == "natural")
+    seed_item, partner_item = natural_pair.items
+    scores = model.score_items([seed_item], ds.item_names)
+    assert scores.shape == (len(ds.item_names),)
+    preds = model.predict_next([seed_item], ds.item_names, top_k=5)
+    assert len(preds) == 5
+    assert all(name != seed_item for name, _ in preds)
+    assert any(name == partner_item for name, _ in preds) or scores[ds.item_names.index(partner_item)] > float(scores.mean())
 
 
 # Milestone 3: Pretrain a small language model (like in the drill) on the basket sequences.
