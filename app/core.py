@@ -271,10 +271,224 @@ def milestone_2(
     return BasketNGramModel(n=n, smoothing=smoothing).fit(ds.train_baskets, ds.item_names, seed=ds.seed)
 
 
-# --- Milestone 3: Pretrain a small language model (like in the drill) on the basket sequences.
-# Hint: Adapt the small language model training from 'Teach a Language Model What Sells Together'.
-def milestone_3():  # TODO(milestone 3)
-    raise NotImplementedError("TODO(milestone 3)")
+# --- Milestone 3: Pretrain a small language model on the basket sequences.
+def _log_softmax(logits: np.ndarray) -> np.ndarray:
+    shifted = logits - logits.max(axis=-1, keepdims=True)
+    return shifted - np.log(np.exp(shifted).sum(axis=-1, keepdims=True))
+
+
+class SmallBasketLM:
+    """Small neural causal/context language model trained from scratch on shuffled basket sequences."""
+
+    def __init__(
+        self,
+        embed_dim: int = 48,
+        hidden_dim: int = 64,
+        epochs: int = 10,
+        batch_size: int = 256,
+        learning_rate: float = 0.015,
+        weight_decay: float = 1e-4,
+        seed: int = 42,
+    ):
+        if embed_dim < 4 or hidden_dim < 4:
+            raise ValueError("embed_dim and hidden_dim must be at least 4")
+        if epochs < 1:
+            raise ValueError("epochs must be at least 1")
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.seed = seed
+
+        self.vocab: list[str] = []
+        self._item_to_id: dict[str, int] = {}
+        self.history: list[dict] = []
+        self._params: dict[str, np.ndarray] = {}
+
+    @property
+    def n_params(self) -> int:
+        return int(sum(arr.size for arr in self._params.values()))
+
+    def _encode_prefixes(self, prefixes: Sequence[Sequence[str]]) -> np.ndarray:
+        """Encode each visible basket prefix as a normalized multi-hot context vector."""
+        x = np.zeros((len(prefixes), len(self.vocab)), dtype=np.float64)
+        bos_idx = self._item_to_id[BOS_TOKEN]
+        for row_idx, prefix in enumerate(prefixes):
+            ids = [self._item_to_id[item] for item in prefix if item in self._item_to_id]
+            if not ids:
+                x[row_idx, bos_idx] = 1.0
+            else:
+                inv = 1.0 / math.sqrt(len(ids))
+                for tok_id in ids:
+                    x[row_idx, tok_id] += inv
+        return x
+
+    def _build_examples(
+        self,
+        baskets: Sequence[Sequence[str]],
+        rng: np.random.Generator,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        prefixes: list[list[str]] = []
+        targets: list[int] = []
+        for basket in baskets:
+            distinct = sorted(set(basket))
+            if len(distinct) < 2:
+                continue
+            perm = rng.permutation(len(distinct))
+            seq = [distinct[int(i)] for i in perm]
+            # Sample prefix -> next-item transitions (every item predicted from preceding items)
+            for pos in range(1, len(seq)):
+                target_name = seq[pos]
+                if target_name in self._item_to_id:
+                    prefixes.append(seq[:pos])
+                    targets.append(self._item_to_id[target_name])
+        x = self._encode_prefixes(prefixes)
+        y = np.asarray(targets, dtype=np.int64)
+        return x, y
+
+    def _forward(self, x: np.ndarray) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
+        p = self._params
+        h0 = x @ p["E"]
+        h1 = np.tanh(h0 @ p["W1"] + p["b1"])
+        logits = h1 @ p["W2"] + h0 @ p["Wres"] + p["b2"]
+        return logits, (h0, h1)
+
+    def cross_entropy(self, x: np.ndarray, y: np.ndarray) -> float:
+        logits, _ = self._forward(x)
+        log_probs = _log_softmax(logits)
+        return float(-log_probs[np.arange(len(y)), y].mean())
+
+    def fit(
+        self,
+        train_baskets: Sequence[Sequence[str]],
+        catalog_names: Sequence[str],
+        val_baskets: Sequence[Sequence[str]] | None = None,
+    ) -> "SmallBasketLM":
+        """Pretrain on shuffled basket sequences with Adam and cosine learning-rate schedule."""
+        self.vocab = [BOS_TOKEN] + list(catalog_names)
+        self._item_to_id = {tok: idx for idx, tok in enumerate(self.vocab)}
+        v_size = len(self.vocab)
+
+        rng = np.random.default_rng(self.seed)
+        self._params = {
+            "E": rng.normal(0.0, 0.08, size=(v_size, self.embed_dim)),
+            "W1": rng.normal(0.0, 1.0 / math.sqrt(self.embed_dim), size=(self.embed_dim, self.hidden_dim)),
+            "b1": np.zeros(self.hidden_dim, dtype=np.float64),
+            "W2": rng.normal(0.0, 1.0 / math.sqrt(self.hidden_dim), size=(self.hidden_dim, v_size)),
+            "Wres": rng.normal(0.0, 1.0 / math.sqrt(self.embed_dim), size=(self.embed_dim, v_size)),
+            "b2": np.zeros(v_size, dtype=np.float64),
+        }
+        adam_m = {k: np.zeros_like(val) for k, val in self._params.items()}
+        adam_v = {k: np.zeros_like(val) for k, val in self._params.items()}
+
+        val_xy = None
+        if val_baskets:
+            val_xy = self._build_examples(val_baskets, np.random.default_rng(self.seed + 999))
+
+        self.history = []
+        step_idx = 0
+        beta1, beta2, eps = 0.9, 0.999, 1e-8
+
+        for epoch in range(1, self.epochs + 1):
+            x_all, y_all = self._build_examples(train_baskets, rng)
+            order = rng.permutation(len(y_all))
+            x_all, y_all = x_all[order], y_all[order]
+
+            progress = (epoch - 1) / max(1, self.epochs - 1) if self.epochs > 1 else 1.0
+            lr = self.learning_rate * (0.15 + 0.85 * 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+            epoch_losses: list[float] = []
+            for start in range(0, len(y_all), self.batch_size):
+                xb = x_all[start : start + self.batch_size]
+                yb = y_all[start : start + self.batch_size]
+                bsz = len(yb)
+
+                logits, (h0, h1) = self._forward(xb)
+                log_probs = _log_softmax(logits)
+                loss = float(-log_probs[np.arange(bsz), yb].mean())
+                epoch_losses.append(loss)
+
+                probs = np.exp(log_probs)
+                d_logits = probs
+                d_logits[np.arange(bsz), yb] -= 1.0
+                d_logits /= bsz
+
+                p = self._params
+                grads = {
+                    "W2": h1.T @ d_logits + self.weight_decay * p["W2"],
+                    "Wres": h0.T @ d_logits + self.weight_decay * p["Wres"],
+                    "b2": d_logits.sum(axis=0),
+                }
+                d_h1 = d_logits @ p["W2"].T
+                d_pre = d_h1 * (1.0 - h1 * h1)
+                grads["W1"] = h0.T @ d_pre + self.weight_decay * p["W1"]
+                grads["b1"] = d_pre.sum(axis=0)
+                d_h0 = d_pre @ p["W1"].T + d_logits @ p["Wres"].T
+                grads["E"] = xb.T @ d_h0 + self.weight_decay * p["E"]
+
+                step_idx += 1
+                bc1 = 1.0 - beta1**step_idx
+                bc2 = 1.0 - beta2**step_idx
+                for name, grad in grads.items():
+                    adam_m[name] = beta1 * adam_m[name] + (1.0 - beta1) * grad
+                    adam_v[name] = beta2 * adam_v[name] + (1.0 - beta2) * (grad * grad)
+                    m_hat = adam_m[name] / bc1
+                    v_hat = adam_v[name] / bc2
+                    p[name] -= lr * m_hat / (np.sqrt(v_hat) + eps)
+
+            val_loss = self.cross_entropy(*val_xy) if val_xy is not None else None
+            self.history.append(
+                {
+                    "epoch": epoch,
+                    "train_loss": round(float(np.mean(epoch_losses)), 4),
+                    "val_loss": round(val_loss, 4) if val_loss is not None else None,
+                    "lr": round(lr, 6),
+                }
+            )
+        return self
+
+    def score_items(self, visible_items: Sequence[str], candidate_names: Sequence[str]) -> np.ndarray:
+        """Compute log P(candidate | visible_items) for every catalogue candidate."""
+        if not self._params:
+            raise RuntimeError("SmallBasketLM must be fitted before scoring.")
+        x = self._encode_prefixes([visible_items])
+        logits, _ = self._forward(x)
+        log_probs = _log_softmax(logits)[0]
+        return np.array(
+            [log_probs[self._item_to_id[name]] if name in self._item_to_id else -20.0 for name in candidate_names],
+            dtype=np.float64,
+        )
+
+    def predict_next(
+        self,
+        visible_items: Sequence[str],
+        candidate_names: Sequence[str],
+        top_k: int = 5,
+    ) -> list[tuple[str, float]]:
+        """Return top-k unseen candidate items ranked by log-probability."""
+        scores = self.score_items(visible_items, candidate_names)
+        seen = set(visible_items)
+        exclude = [idx for idx, name in enumerate(candidate_names) if name in seen]
+        top_indices = recommend_top_k(scores, k=top_k, exclude=exclude)
+        return [(candidate_names[idx], float(scores[idx])) for idx in top_indices]
+
+
+def milestone_3(
+    dataset: BasketDataset | None = None,
+    embed_dim: int = 48,
+    hidden_dim: int = 64,
+    epochs: int = 10,
+) -> SmallBasketLM:
+    """Milestone 3 entrypoint: pretrain SmallBasketLM on shuffled basket sequences."""
+    ds = milestone_1() if dataset is None else dataset
+    return SmallBasketLM(
+        embed_dim=embed_dim,
+        hidden_dim=hidden_dim,
+        epochs=epochs,
+        seed=ds.seed,
+    ).fit(ds.train_baskets, ds.item_names, val_baskets=ds.test_baskets)
 
 
 # --- Milestone 4: Evaluate both models using next-item prediction metrics (e.g., accuracy, rank).

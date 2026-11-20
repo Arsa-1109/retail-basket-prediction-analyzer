@@ -1,7 +1,7 @@
 """Unit and CLI tests for Retail Basket Prediction Analyzer (Milestones 1-5)."""
 import pytest
 
-from app.core import BasketNGramModel, milestone_1, milestone_2, parse_basket, support_of
+from app.core import BasketNGramModel, SmallBasketLM, milestone_1, milestone_2, milestone_3, parse_basket, support_of
 
 
 # Milestone 1: Generate a synthetic dataset of shopping baskets with planted itemsets.
@@ -46,9 +46,21 @@ def test_milestone_2():
 
 
 # Milestone 3: Pretrain a small language model (like in the drill) on the basket sequences.
-@pytest.mark.skip(reason="remove this line when you start milestone 3")
 def test_milestone_3():
-    raise NotImplementedError("write the test for milestone 3")
+    ds = milestone_1(n_baskets=400, n_items=160, seed=42)
+    lm = milestone_3(dataset=ds, embed_dim=32, hidden_dim=48, epochs=6)
+    assert lm.n_params > 0
+    assert len(lm.history) == 6
+    assert lm.history[-1]["train_loss"] < lm.history[0]["train_loss"]
+    assert lm.history[-1]["val_loss"] is not None
+
+    natural_pair = next(p for p in ds.planted if len(p.items) == 2 and p.kind == "natural")
+    seed_item, _ = natural_pair.items
+    scores = lm.score_items([seed_item], ds.item_names)
+    assert scores.shape == (len(ds.item_names),)
+    preds = lm.predict_next([seed_item], ds.item_names, top_k=5)
+    assert len(preds) == 5
+    assert all(name != seed_item for name, _ in preds)
 
 
 # Milestone 4: Evaluate both models using next-item prediction metrics (e.g., accuracy, rank).
