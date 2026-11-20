@@ -4,6 +4,8 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 import math
+import json
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
@@ -619,6 +621,202 @@ def milestone_4(
 
 
 # --- Milestone 5: Present a comparison of the models' performance.
-# Hint: Summarize and visualize the evaluation results for a clear comparison.
-def milestone_5():  # TODO(milestone 5)
-    raise NotImplementedError("TODO(milestone 5)")
+def build_scenario_cases(dataset: BasketDataset, max_per_scenario: int = 80, seed: int = 42) -> dict[str, list[dict]]:
+    """Build targeted evaluation slices: contiguous vs non-adjacent vs cross-category triggers."""
+    rng = np.random.default_rng(seed)
+    contiguous: list[dict] = []
+    non_adjacent: list[dict] = []
+    surprising: list[dict] = []
+
+    for basket in dataset.test_baskets:
+        distinct = sorted(set(basket))
+        bset = set(distinct)
+        for p in dataset.planted:
+            pset = set(p.items)
+            if not (pset <= bset):
+                continue
+            target = str(rng.choice(list(p.items)))
+            planted_vis = [x for x in p.items if x != target]
+            fillers = [x for x in distinct if x not in pset]
+
+            # Contiguous: planted partners sit right at the tail of visible
+            if len(contiguous) < max_per_scenario:
+                contiguous.append({"visible": fillers + planted_vis, "target": target})
+
+            # Non-adjacent: at least 2 filler items sit between planted partners and tail
+            if len(fillers) >= 2 and len(non_adjacent) < max_per_scenario:
+                non_adjacent.append({"visible": planted_vis + fillers, "target": target})
+
+            # Surprising cross-category bundle
+            if p.kind == "surprising" and len(surprising) < max_per_scenario:
+                mixed = planted_vis + fillers
+                rng.shuffle(mixed)
+                surprising.append({"visible": mixed, "target": target})
+            break
+
+    return {
+        "Contiguous Planted Trigger": contiguous,
+        "Non-Adjacent Planted Trigger": non_adjacent,
+        "Surprising Cross-Category": surprising,
+    }
+
+
+def scenario_analysis(
+    dataset: BasketDataset,
+    ngram_model: BasketNGramModel,
+    lm_model: SmallBasketLM,
+    max_per_scenario: int = 80,
+    seed: int = 42,
+) -> dict[str, dict]:
+    """Compare Popularity, N-Gram, and Small LM across structural basket scenarios."""
+    scenarios = build_scenario_cases(dataset, max_per_scenario=max_per_scenario, seed=seed)
+    pop_vec = popularity_scores(dataset.train_baskets, dataset.item_names)
+    predictors = {
+        "Popularity Baseline": lambda _vis: pop_vec,
+        f"N-Gram (n={ngram_model.n})": lambda vis: ngram_model.score_items(vis, dataset.item_names),
+        f"Small LM (d={lm_model.embed_dim})": lambda vis: lm_model.score_items(vis, dataset.item_names),
+    }
+    out: dict[str, dict] = {}
+    for scenario_name, cases in scenarios.items():
+        if not cases:
+            continue
+        out[scenario_name] = {
+            model_name: score_cases_with_fn(fn, cases, dataset)
+            for model_name, fn in predictors.items()
+        }
+    return out
+
+
+def complexity_ablation(
+    dataset: BasketDataset,
+    cases: Sequence[dict],
+) -> list[dict]:
+    """Benchmark n-gram orders (2, 3, 4) vs SmallBasketLM capacities on identical held-out cases."""
+    rows: list[dict] = []
+    for order in (2, 3, 4):
+        ng = BasketNGramModel(n=order, smoothing=0.1).fit(dataset.train_baskets, dataset.item_names, seed=dataset.seed)
+        n_states = sum(len(v) for v in ng._ngram_counts[order].values())
+        metrics = score_cases_with_fn(lambda vis, m=ng: m.score_items(vis, dataset.item_names), cases, dataset)
+        rows.append(
+            {
+                "model": f"N-Gram (n={order})",
+                "capacity": f"{n_states} contexts",
+                "top1_acc": metrics["top1_acc"],
+                "recall_at_5": metrics["recall_at_5"],
+                "mrr": metrics["mrr"],
+                "mean_rank": metrics["mean_rank"],
+            }
+        )
+
+    for emb, hid in [(16, 24), (32, 48), (48, 64)]:
+        lm = SmallBasketLM(embed_dim=emb, hidden_dim=hid, epochs=8, seed=dataset.seed).fit(
+            dataset.train_baskets, dataset.item_names
+        )
+        metrics = score_cases_with_fn(lambda vis, m=lm: m.score_items(vis, dataset.item_names), cases, dataset)
+        rows.append(
+            {
+                "model": f"Small LM (d={emb}, h={hid})",
+                "capacity": f"{lm.n_params:,} params",
+                "top1_acc": metrics["top1_acc"],
+                "recall_at_5": metrics["recall_at_5"],
+                "mrr": metrics["mrr"],
+                "mean_rank": metrics["mean_rank"],
+            }
+        )
+    return rows
+
+
+def format_comparison_report(report: dict) -> str:
+    """Format model metrics, ASCII MRR chart, scenario breakdown, and ablation into readable text."""
+    ev = report["evaluation"]
+    lines = [
+        "=== Retail Basket Prediction Analyzer: Model Comparison ===",
+        (
+            f"Catalog: {ev['n_catalog']} SKUs | Train baskets: {ev['n_train']} | "
+            f"Held-out baskets: {ev['n_test']} | Eval cases: {ev['n_cases']}"
+        ),
+        "",
+        "Model                    | Top-1   | Recall@3 | Recall@5 | Recall@10 | Mean Rank | MRR    | MAP@5",
+        "-------------------------+---------+----------+----------+-----------+-----------+--------+-------",
+    ]
+    max_mrr = max((row["mrr"] for row in ev["metrics"].values()), default=1.0) or 1.0
+    for name, row in ev["metrics"].items():
+        lines.append(
+            f"{name:<24} | {row['top1_acc']:>6.1%} | {row['recall_at_3']:>7.1%} | "
+            f"{row['recall_at_5']:>7.1%} | {row['recall_at_10']:>8.1%} | "
+            f"{row['mean_rank']:>9.2f} | {row['mrr']:.4f} | {row['map_at_5']:.4f}"
+        )
+
+    lines.append("")
+    lines.append("MRR Comparison (higher is better):")
+    for name, row in ev["metrics"].items():
+        bar_len = max(1, int(round((row["mrr"] / max_mrr) * 28)))
+        lines.append(f"  {name:<24} | {'#' * bar_len:<28} {row['mrr']:.4f}")
+
+    scenarios = report.get("scenarios", {})
+    if scenarios:
+        lines.append("")
+        lines.append("=== Scenario Breakdown (MRR / Recall@5) ===")
+        for sc_name, sc_metrics in scenarios.items():
+            parts = [
+                f"{m_name}: MRR={vals['mrr']:.4f}, R@5={vals['recall_at_5']:.1%}"
+                for m_name, vals in sc_metrics.items()
+            ]
+            lines.append(f"  {sc_name} (n={next(iter(sc_metrics.values()))['n_cases']}):")
+            for part in parts:
+                lines.append(f"    - {part}")
+
+    ablation = report.get("ablation", [])
+    if ablation:
+        lines.append("")
+        lines.append("=== Complexity & Capacity Ablation ===")
+        lines.append("Model                   | Capacity         | Top-1   | Recall@5 | Mean Rank | MRR")
+        lines.append("------------------------+------------------+---------+----------+-----------+-------")
+        for row in ablation:
+            lines.append(
+                f"{row['model']:<23} | {row['capacity']:<16} | {row['top1_acc']:>6.1%} | "
+                f"{row['recall_at_5']:>7.1%} | {row['mean_rank']:>9.2f} | {row['mrr']:.4f}"
+            )
+    return "\n".join(lines)
+
+
+def save_comparison_report(output_path: str | Path, report: dict) -> Path:
+    """Save structured evaluation/comparison results to .json or formatted .txt."""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix.lower() == ".json":
+        serializable = {
+            "evaluation": {
+                k: v for k, v in report["evaluation"].items() if k != "cases"
+            },
+            "scenarios": report.get("scenarios", {}),
+            "ablation": report.get("ablation", []),
+        }
+        path.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+        return path
+    path.write_text(format_comparison_report(report) + "\n", encoding="utf-8")
+    return path
+
+
+def milestone_5(
+    n_baskets: int = 2500,
+    n_items: int = 160,
+    n_cases: int = 250,
+    seed: int = 42,
+    include_ablation: bool = True,
+) -> dict:
+    """Milestone 5 entrypoint: end-to-end training, evaluation, scenario breakdown, and report."""
+    ds = milestone_1(n_baskets=n_baskets, n_items=n_items, seed=seed)
+    ngram = milestone_2(dataset=ds, n=3, smoothing=0.1)
+    lm = milestone_3(dataset=ds, embed_dim=48, hidden_dim=64, epochs=10)
+    ev = milestone_4(dataset=ds, ngram_model=ngram, lm_model=lm, n_cases=n_cases)
+    scenarios = scenario_analysis(ds, ngram, lm, max_per_scenario=min(80, n_cases), seed=seed)
+    ablation = complexity_ablation(ds, ev["cases"]) if include_ablation else []
+    report = {
+        "evaluation": ev,
+        "scenarios": scenarios,
+        "ablation": ablation,
+        "lm_history": lm.history,
+    }
+    report["formatted_text"] = format_comparison_report(report)
+    return report

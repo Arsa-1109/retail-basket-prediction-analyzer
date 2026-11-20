@@ -1,6 +1,9 @@
 """Unit and CLI tests for Retail Basket Prediction Analyzer (Milestones 1-5)."""
+import json
+
 import pytest
 
+from app import cli
 from app.core import (
     BasketNGramModel,
     SmallBasketLM,
@@ -8,6 +11,7 @@ from app.core import (
     milestone_2,
     milestone_3,
     milestone_4,
+    milestone_5,
     parse_basket,
     support_of,
 )
@@ -90,7 +94,31 @@ def test_milestone_4():
 
 
 # Milestone 5: Present a comparison of the models' performance.
-@pytest.mark.skip(reason="remove this line when you start milestone 5")
-def test_milestone_5():
-    raise NotImplementedError("write the test for milestone 5")
+def test_milestone_5(capsys, tmp_path):
+    report = milestone_5(n_baskets=500, n_items=160, n_cases=80, seed=42, include_ablation=True)
+    assert "Retail Basket Prediction Analyzer: Model Comparison" in report["formatted_text"]
+    assert "Scenario Breakdown" in report["formatted_text"]
+    assert "Complexity & Capacity Ablation" in report["formatted_text"]
+    assert len(report["ablation"]) == 6
+
+    out_json = tmp_path / "comparison.json"
+    cli.main(["compare", "--baskets", "400", "--cases", "60", "--no-ablation", "--save", str(out_json)])
+    out = capsys.readouterr().out
+    assert "Popularity Baseline" in out
+    assert out_json.exists()
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    assert "evaluation" in payload and "scenarios" in payload
+
+    cli.main(["stats", "--baskets", "300"])
+    stats_out = capsys.readouterr().out
+    assert "Planted sets:" in stats_out
+
+    cli.main(["predict", "--baskets", "300", "--top-k", "3"])
+    pred_out = capsys.readouterr().out
+    assert "N-Gram top predictions:" in pred_out
+    assert "Small LM top predictions:" in pred_out
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["predict", "--baskets", "300", "--items", "NonExistent SKU 999"])
+    assert exc.value.code == 1
 
